@@ -89,6 +89,7 @@
   #engineBadge{font-size:.68rem; font-weight:700; padding:3px 10px; border-radius:999px; letter-spacing:.3px;}
   #engineBadge.google{background:#ccfbf1; color:#0f766e;}
   #engineBadge.mymemory{background:#fef3c7; color:#92400e;}
+  #engineBadge.cache{background:#dbeafe; color:#1d4ed8;}
   #engineBadge.idle{background:#f3f4f6; color:#6b7280;}
   #outputText{
     min-height:90px; background:#fafafa; border:2px dashed var(--line); border-radius:14px;
@@ -183,6 +184,7 @@
     <div class="histhead">
       <h2>🕘 Riwayat</h2>
       <span id="histCount"></span>
+      <span id="cacheCount" title="Terjemahan tersimpan di cache lokal (hemat kuota)"></span>
       <button id="btnClearHistory">Hapus semua</button>
     </div>
     <div id="historyList"></div>
@@ -190,7 +192,8 @@
 
   <footer>
     Ditenagai Google Translate &amp; MyMemory (gratis, tanpa API key) ·<br>
-    Riwayat &amp; pengaturan hanya tersimpan di perangkatmu — tidak dikirim ke server manapun.<br>
+    🔒 Teks yang kamu terjemahkan dikirim ke Google Translate / MyMemory untuk diproses (sesuai kebijakan privasi masing-masing).<br>
+    Riwayat, cache, &amp; pengaturan hanya tersimpan di perangkatmu — tidak dibagikan antar pengguna.<br>
     🎤 Input suara butuh Chrome/Edge + izin mikrofon, dan berjalan paling baik saat aplikasi di-host online (mis. GitHub Pages).
   </footer>
 </div>
@@ -323,6 +326,58 @@ async function translate(text, src, tgt) {
   }
 }
 
+// ================= PENGAMANAN: RATE-LIMIT & CACHE LOKAL =================
+var RATE = { minGapMs: 1000, maxPerMinute: 30, maxChars: 3000, windowMs: 60000 };
+var rateTimestamps = [];
+function rateLimitOk() {
+  var now = Date.now();
+  rateTimestamps = rateTimestamps.filter(function (t) { return now - t < RATE.windowMs; });
+  if (rateTimestamps.length >= RATE.maxPerMinute) return false;
+  var last = rateTimestamps[rateTimestamps.length - 1];
+  if (last && now - last < RATE.minGapMs) return false;
+  rateTimestamps.push(now);
+  return true;
+}
+function resetRateLimit() { rateTimestamps = []; }
+
+var CACHE_KEY = 'penerjemah.cache';
+var MAX_CACHE = 300;
+var CACHE_MAX_TEXT = 500; // hanya cache teks pendek (hemat ruang)
+function loadCache() {
+  try {
+    var raw = localStorage.getItem(CACHE_KEY);
+    var o = raw ? JSON.parse(raw) : {};
+    return (o && typeof o === 'object') ? o : {};
+  } catch (e) { return {}; }
+}
+function saveCache(c) {
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify(c)); } catch (e) {}
+}
+function cacheKey(src, tgt, text) { return src + '|' + tgt + '|' + text; }
+function cacheGet(src, tgt, text) {
+  var c = loadCache();
+  var hit = c[cacheKey(src, tgt, text)];
+  return hit && hit.text ? hit : null;
+}
+function cachePut(src, tgt, text, result) {
+  if (text.length > CACHE_MAX_TEXT) return;
+  var c = loadCache();
+  c[cacheKey(src, tgt, text)] = { text: result.text, engine: result.engine, ts: Date.now() };
+  var keys = Object.keys(c);
+  if (keys.length > MAX_CACHE) {
+    keys.sort(function (a, b) { return c[a].ts - c[b].ts; });
+    for (var i = 0; i < keys.length - MAX_CACHE; i++) delete c[keys[i]];
+  }
+  saveCache(c);
+  updateCacheCount();
+}
+function updateCacheCount() {
+  var el = $('cacheCount');
+  if (!el) return;
+  var n = Object.keys(loadCache()).length;
+  el.textContent = n ? '💾 ' + n : '';
+}
+
 // ================= UI =================
 function populateSelects() {
   var srcOpts = '', tgtOpts = '';
@@ -355,8 +410,9 @@ function updateOutLang() {
 function setBadge(engine) {
   var b = $('engineBadge');
   if (!engine) { b.className = 'idle'; b.textContent = 'SIAP'; return; }
-  b.className = engine === 'Google' ? 'google' : 'mymemory';
-  b.textContent = engine === 'Google' ? 'GOOGLE' : 'MYMEMORY';
+  if (engine === 'Google') { b.className = 'google'; b.textContent = 'GOOGLE'; return; }
+  if (engine === 'Cache') { b.className = 'cache'; b.textContent = 'CACHE'; return; }
+  b.className = 'mymemory'; b.textContent = 'MYMEMORY';
 }
 
 function setStatus(msg) {
@@ -381,12 +437,31 @@ async function doTranslate(manual) {
     setBadge(null);
     return;
   }
+  if (input.length > RATE.maxChars) {
+    renderOutput('Teks terlalu panjang — maksimal ' + RATE.maxChars + ' karakter per terjemahan.', true);
+    setBadge(null);
+    setStatus('Pecah teks menjadi beberapa bagian yang lebih pendek.');
+    return;
+  }
+  var cached = cacheGet(src, tgt, input);
+  if (cached) {
+    setBadge('Cache');
+    renderOutput(cached.text, false);
+    setStatus('⚡ Dari cache lokal — hemat kuota, tanpa kirim ulang.');
+    addToHistory({ src: src, tgt: tgt, in: input, out: cached.text, engine: 'Cache', ts: Date.now() });
+    return;
+  }
+  if (!rateLimitOk()) {
+    setStatus('⏳ Terlalu cepat — tunggu sebentar lalu coba lagi.');
+    return;
+  }
   var btn = $('btnTranslate');
   if (btn) btn.disabled = true;
   setStatus('Menerjemahkan…');
   setBadge(null);
   try {
     var r = await translate(input, src, tgt);
+    cachePut(src, tgt, input, r);
     var detectedNote = (src === 'auto' && r.src && r.src !== 'auto' && r.engine === 'MyMemory')
       ? ' · Terdeteksi: ' + langName(r.src) : '';
     setBadge(r.engine);
@@ -592,6 +667,7 @@ function saveSettings() {
 function init() {
   populateSelects();
   renderHistory();
+  updateCacheCount();
   updateCharCount();
 
   var debounceTimer = null;

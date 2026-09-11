@@ -48,7 +48,7 @@ function makeEl(id) {
 const ELEMENT_IDS = ['srcLang', 'tgtLang', 'btnSwap', 'inputText', 'charCount',
   'autoToggle', 'btnTranslate', 'outputText', 'engineBadge', 'statusLine',
   'btnCopy', 'btnSpeak', 'historyList', 'histCount', 'btnClearHistory', 'outLang',
-  'btnVoice', 'voiceLangWrap', 'voiceLang', 'btnSpeakIn'];
+  'btnVoice', 'voiceLangWrap', 'voiceLang', 'btnSpeakIn', 'cacheCount'];
 const elements = {};
 ELEMENT_IDS.forEach(id => { elements[id] = makeEl(id); });
 global.document = {
@@ -59,7 +59,9 @@ global.document = {
 // ---- mock fetch ----
 let GOOGLE_OK = false;      // false → Google diblokir (halaman HTML) → fallback MyMemory
 let MM_QUOTA = false;
+let fetchCount = 0;
 global.fetch = async (url) => {
+  fetchCount++;
   const u = String(url);
   if (u.includes('translate.googleapis.com')) {
     if (GOOGLE_OK) {
@@ -86,12 +88,14 @@ const wrapper = '(function(){\n' + js +
   ' swapLangs, doTranslate, updateCharCount, addToHistory, clearHistory, renderHistory,' +
   ' restoreHistory, loadHistory, saveHistory, saveSettings, loadSettings, speak, esc,' +
   ' getRecognition, voiceRecognitionLang, updateVoiceLangVisibility, startVoice, stopVoice,' +
-  ' toggleVoice, getVoiceActive: function(){ return voiceActive; } };\n})';
+  ' toggleVoice, getVoiceActive: function(){ return voiceActive; },' +
+  ' rateLimitOk, resetRateLimit, cacheGet, cachePut, loadCache, updateCacheCount, RATE };\n})';
 eval(wrapper).call(sandbox);
 const { detectLang, splitChunks, translate, translateGoogle, translateMyMemory, swapLangs,
   doTranslate, updateCharCount, addToHistory, clearHistory, renderHistory, restoreHistory,
   loadHistory, saveHistory, saveSettings, loadSettings, getRecognition, voiceRecognitionLang,
-  updateVoiceLangVisibility, startVoice, stopVoice, toggleVoice, getVoiceActive } = sandbox.__api;
+  updateVoiceLangVisibility, startVoice, stopVoice, toggleVoice, getVoiceActive,
+  rateLimitOk, resetRateLimit, cacheGet, cachePut, loadCache, updateCacheCount, RATE } = sandbox.__api;
 
 // ---- tests ----
 let pass = 0, fail = 0;
@@ -170,6 +174,7 @@ async function tick() { await new Promise(r => setTimeout(r, 10)); }
   t('swap dari auto → tgt jadi en', elements['srcLang'].value === 'ru' && elements['tgtLang'].value === 'en');
 
   // --- terjemah via UI (doTranslate) ---
+  resetRateLimit();
   elements['inputText'].value = 'Hello world';
   elements['srcLang'].value = 'auto';
   elements['tgtLang'].value = 'id';
@@ -197,6 +202,7 @@ async function tick() { await new Promise(r => setTimeout(r, 10)); }
   saveHistory([]);
 
   // --- restore riwayat → isi ulang & terjemah ---
+  resetRateLimit();
   addToHistory({ src: 'ru', tgt: 'id', in: 'Привет мир', out: 'Halo Dunia', engine: 'MyMemory', ts: Date.now() });
   elements['inputText'].value = '';
   restoreHistory(0);
@@ -231,6 +237,47 @@ async function tick() { await new Promise(r => setTimeout(r, 10)); }
   toggleVoice();
   t('voice: toggle saat tidak didukung tetap aman', getVoiceActive() === false);
   elements['srcLang'].value = 'auto';
+
+  // --- rate-limit ---
+  resetRateLimit();
+  t('rate: pertama diizinkan', rateLimitOk() === true);
+  t('rate: kedua terlalu cepat ditolak', rateLimitOk() === false);
+  resetRateLimit();
+  RATE.minGapMs = 0;
+  let rateOkCount = 0;
+  for (let i = 0; i < 35; i++) if (rateLimitOk()) rateOkCount++;
+  t('rate: maks 30 terjemahan per menit', rateOkCount === 30);
+  RATE.minGapMs = 1000;
+  resetRateLimit();
+  const fcMaxChars = fetchCount;
+  elements['inputText'].value = 'x'.repeat(3001);
+  elements['srcLang'].value = 'en';
+  elements['tgtLang'].value = 'id';
+  await doTranslate(true);
+  t('rate: teks >3000 karakter ditolak', elements['outputText'].textContent.includes('maksimal'));
+  t('rate: penolakan tanpa panggilan server', fetchCount === fcMaxChars);
+  elements['inputText'].value = '';
+
+  // --- cache lokal ---
+  resetRateLimit();
+  cachePut('en', 'id', 'hello world', { text: 'Halo Dunia (cache)', engine: 'Google' });
+  t('cache: entri tersimpan', cacheGet('en', 'id', 'hello world').text === 'Halo Dunia (cache)');
+  t('cache: miss mengembalikan null', cacheGet('en', 'id', 'belum ada') === null);
+  t('cache: penghitung muncul', elements['cacheCount'].textContent.includes('💾'));
+  const fcCache = fetchCount;
+  elements['inputText'].value = 'hello world';
+  elements['srcLang'].value = 'en';
+  elements['tgtLang'].value = 'id';
+  await doTranslate(true);
+  t('cache: output dari cache', elements['outputText'].textContent === 'Halo Dunia (cache)');
+  t('cache: badge CACHE', elements['engineBadge'].textContent === 'CACHE');
+  t('cache: tanpa panggilan server (hemat kuota)', fetchCount === fcCache);
+  for (let i = 0; i < 310; i++) cachePut('en', 'id', 't' + i, { text: 'o' + i, engine: 'Google' });
+  t('cache: dibatasi 300 entri', Object.keys(loadCache()).length <= 300);
+  saveHistory([]);
+  localStorage.removeItem('penerjemah.cache');
+  updateCacheCount();
+  t('cache: penghitung kosong setelah dibersihkan', elements['cacheCount'].textContent === '');
 
   // --- settings ---
   elements['srcLang'].value = 'zh';
